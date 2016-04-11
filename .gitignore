@@ -1,0 +1,6 @@
+misc/*
+results/*
+*.pyc
+*.so
+*.pkl
+cython_convolution.c
