@@ -1,6 +1,4 @@
 # BunkNeuralNets
-NOTICE: This repository has been temporarily removed, as it is currently being submitted as course project UCSB CS 291K.
-
 My neural network library for mostly educational purposes - using Python with NumPy and Cython, and is CPU only.
 
 A script for compiling the Cython file on Linux is included.
