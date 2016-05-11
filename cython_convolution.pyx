@@ -4,6 +4,8 @@
 #######################################################################################
 import numpy as np
 cimport numpy as np
+cimport cython
+cimport cython.parallel
 
 #fix a datatype for the arrays
 DTYPE = np.float32
@@ -11,12 +13,11 @@ ctypedef np.float32_t DTYPE_t
 #DTYPE = np.float64
 #ctypedef np.float64_t DTYPE_t
 
-cdef inline unsigned int uint_max(unsigned int a, unsigned int b): return a if a >= b else b
-cdef inline unsigned int uint_min(unsigned int a, unsigned int b): return a if a <= b else b
-cdef inline          int  int_max(         int a,          int b): return a if a >= b else b
-cdef inline          int  int_min(         int a,          int b): return a if a <= b else b
+cdef inline unsigned int uint_max(unsigned int a, unsigned int b) nogil: return a if a >= b else b
+cdef inline unsigned int uint_min(unsigned int a, unsigned int b) nogil: return a if a <= b else b
+cdef inline          int  int_max(         int a,          int b) nogil: return a if a >= b else b
+cdef inline          int  int_min(         int a,          int b) nogil: return a if a <= b else b
 
-cimport cython
 @cython.boundscheck(False) # turn off bounds-checking for entire function
 @cython.wraparound(False)
 
@@ -64,7 +65,7 @@ def my_batch_convolve_images(np.ndarray[DTYPE_t, ndim=4] xbatch, np.ndarray[DTYP
 	cdef DTYPE_t tempval
 	
 	if mode == 0:
-		for sidx in range(outshape0): # loop over samples in batch
+		for sidx in cython.parallel.prange(outshape0,nogil=True): # loop over samples in batch
 			for widx in range(outshape1): # loop over filters in set
 				for ii in range(outshape2): # loop over locations in the output array
 					for jj in range(outshape3):
@@ -75,9 +76,9 @@ def my_batch_convolve_images(np.ndarray[DTYPE_t, ndim=4] xbatch, np.ndarray[DTYP
 							for wi in range(wshape2): # loop over shape of W, the smaller one (and flip W)
 								for wj in range(wshape3):
 									tempval += wset[widx,chidx,wshape2-1-wi,wshape3-1-wj] * xbatch[sidx,chidx,ii+wi,jj+wj]
-						outarr[sidx,widx,ii,jj] = tempval
+						outarr[sidx,widx,ii,jj] += tempval # equivalent to:  = tempval
 	elif mode == 2:
-		for sidx in range(outshape0): # loop over samples in batch
+		for sidx in cython.parallel.prange(outshape0,nogil=True): # loop over samples in batch
 			for chidx in range(outshape1): # loop over nchannels-out == nchannels-in
 				for ii in range(outshape2): # loop over locations in the output array
 					for jj in range(outshape3):
@@ -87,10 +88,10 @@ def my_batch_convolve_images(np.ndarray[DTYPE_t, ndim=4] xbatch, np.ndarray[DTYP
 						for wi in range(wshape2): # loop over shape of W, the smaller one
 							for wj in range(wshape3):
 								tempval += wset[0,0,wi,wj] * xbatch[sidx,chidx,(ii*poolsizeDim2IfModeIs2)+wi,(jj*poolsizeDim3IfModeIs2)+wj]
-						outarr[sidx,chidx,ii,jj] = tempval
+						outarr[sidx,chidx,ii,jj] += tempval # equivalent to:  = tempval
 	elif mode == 1:
 		if wshape2 >= xshape2 and wshape3 >= xshape3:
-			for sidx in range(outshape0): # loop over samples in batch
+			for sidx in cython.parallel.prange(outshape0,nogil=True): # loop over samples in batch
 				for widx in range(outshape1): # loop over filters in set
 					for ii in range(outshape2): # loop over locations in the output array
 						for jj in range(outshape3):
@@ -105,9 +106,9 @@ def my_batch_convolve_images(np.ndarray[DTYPE_t, ndim=4] xbatch, np.ndarray[DTYP
 								for wi in range(wimin,wimax): # loop over shape of X, the smaller one
 									for wj in range(wjmin,wjmax):
 										tempval += xbatch[sidx,chidx,xshape2-1-wi,xshape3-1-wj] * wset[widx,chidx,ii+wi+1-xshape2,jj+wj+1-xshape3]
-							outarr[sidx,widx,ii,jj] = tempval
+							outarr[sidx,widx,ii,jj] += tempval # equivalent to:  = tempval
 		elif wshape2 < xshape2 and wshape3 < xshape3:
-			for sidx in range(outshape0): # loop over samples in batch
+			for sidx in cython.parallel.prange(outshape0,nogil=True): # loop over samples in batch
 				for widx in range(outshape1): # loop over filters in set
 					for ii in range(outshape2): # loop over locations in the output array
 						for jj in range(outshape3):
@@ -122,7 +123,7 @@ def my_batch_convolve_images(np.ndarray[DTYPE_t, ndim=4] xbatch, np.ndarray[DTYP
 								for wi in range(wimin,wimax): # loop over shape of W, the smaller one
 									for wj in range(wjmin,wjmax):
 										tempval += wset[widx,chidx,wshape2-1-wi,wshape3-1-wj] * xbatch[sidx,chidx,ii+wi+1-wshape2,jj+wj+1-wshape3]
-							outarr[sidx,widx,ii,jj] = tempval
+							outarr[sidx,widx,ii,jj] += tempval # equivalent to:  = tempval
 		else:
 			print("unsupported shape for convolution in my_batch_convolve_images()")
 	else:
@@ -136,6 +137,9 @@ def my_batch_convolve_images(np.ndarray[DTYPE_t, ndim=4] xbatch, np.ndarray[DTYP
 #
 # note: filt-dimension = (im-in-dimension) - (im-out-dimension) + 1
 #######################################################################################
+
+@cython.boundscheck(False) # turn off bounds-checking for entire function
+@cython.wraparound(False)
 
 def my_batch_dJdW(np.ndarray[DTYPE_t, ndim=4] lastinput, np.ndarray[DTYPE_t, ndim=4] littledelta):
 	assert(lastinput.shape[2] > littledelta.shape[2] and lastinput.shape[3] > littledelta.shape[3])
@@ -156,7 +160,7 @@ def my_batch_dJdW(np.ndarray[DTYPE_t, ndim=4] lastinput, np.ndarray[DTYPE_t, ndi
 	cdef int sidx, filtidx, chidx
 	cdef int wi, wj, ldi, ldj
 	
-	for sidx in range(lastinputshape0): # loop over samples in batch
+	for sidx in cython.parallel.prange(lastinputshape0,nogil=True): # loop over samples in batch
 		for filtidx in range(littledeltashape1): # loop over output filters channels in littledelta
 			for chidx in range(lastinputshape1): # loop over input channels in lastinput
 				
