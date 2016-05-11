@@ -3,11 +3,14 @@ Covered by LICENSE.txt, which contains the "MIT License (Expat)".
 '''
 import numpy as np
 import layer_mlp
-import sigmoids
+
+import activations
+import costfuncs
+from costfuncs import ClassificationAccuracy
 import theanos_MNIST_loader
 import readcifar10
-import utils
 import sys, imp
+import utils
 try:
 	imp.find_module('matplotlib')
 	matplotlibAvailable = True
@@ -80,16 +83,20 @@ maxNumEpochs = 200
 batchesPerTrainEpoch = int(trainSet[0].shape[0]) / int(batchsize)
 batchesPerValidEpoch = int(testSet[0].shape[0]) / int(batchsize)
 LEARNRATE = 0.07
-mysigmoid = sigmoids.sigmoid()
+myactivation = activations.sigmoid
+mycostfunc = costfuncs.SoftmaxCrossEntropy
 
 #---------------------------------------------
-layer0 = layer_mlp.mlplayer(Nin, Nhidden, mysigmoid, "layer1", checkgradients=CheckNetworkGradients)
-layer1 = layer_mlp.mlplayer(Nhidden, Nhidden, mysigmoid, "layer2", checkgradients=CheckNetworkGradients)
-layer2 = layer_mlp.mlplayer(Nhidden, Nout, mysigmoid, "layer3", checkgradients=CheckNetworkGradients)
+layer0 = layer_mlp.mlplayer(Nin, Nhidden, activation=myactivation, costfunc=mycostfunc, layerName="layer0", checkgradients=CheckNetworkGradients)
+layer1 = layer_mlp.mlplayer(Nhidden, Nhidden, activation=myactivation, costfunc=mycostfunc, layerName="layer1", checkgradients=CheckNetworkGradients)
+layer2 = layer_mlp.mlplayer(Nhidden, Nout, activation=None, costfunc=mycostfunc, layerName="layer2", checkgradients=CheckNetworkGradients)
 layer0.layerNext = layer1
 layer1.layerNext = layer2
 layer2.layerPrev = layer1
 layer1.layerPrev = layer0
+
+firstlayer = layer0
+lastlayer = layer2
 
 epochindicessaved = []
 valaccuracies = []
@@ -101,18 +108,29 @@ if matplotlibAvailable and (ViewFilters or ViewSamples):
 
 for epoch in range(maxNumEpochs):
 	totaloflosses = 0.
+	meantrainacc = 0.
+	numtrainevals = 0
 	for batch in range(batchesPerTrainEpoch):
-		layer0.FeedForwardPredict(trainSet[0][(batch*batchsize):((batch+1)*batchsize),:])
-		loss = layer2.BackPropUpdate_MSE(trainSet[1][(batch*batchsize):((batch+1)*batchsize),:], LEARNRATE)
+		batch_xs = trainSet[0][(batch*batchsize):((batch+1)*batchsize),:]
+		batch_ys = trainSet[1][(batch*batchsize):((batch+1)*batchsize),:]
+		
+		preds = firstlayer.FeedForwardPredict(batch_xs)
+		loss = firstlayer.ComputeCost(batch_ys)
+		meantrainacc += ClassificationAccuracy(preds, batch_ys)
+		lastlayer.BackPropUpdate(batch_ys, LEARNRATE)
+		
+		numtrainevals += 1
 		totaloflosses += loss
-		if batch % 500 == 0:
-			print("loss at epoch "+str(epoch+1)+"/"+str(maxNumEpochs)+", batch "+str(batch+1)+"/"+str(batchesPerTrainEpoch)+" == "+str(loss))
+		if (batch+1) % 500 == 0:
+			print("epoch "+str(epoch+1)+"/"+str(maxNumEpochs)+", batch "+str(batch+1)+"/"+str(batchesPerTrainEpoch)+", loss: "+str(loss)+", training accuracy: "+str((meantrainacc/float(numtrainevals))*100.))
+			meantrainacc = 0.
+			numtrainevals = 0
 	losses.append(totaloflosses / allDTYPE(batchesPerTrainEpoch))
 	
 	meanvalidacc = 0.
 	for batch in range(batchesPerValidEpoch):
-		layer0.FeedForwardPredict(testSet[0][(batch*batchsize):((batch+1)*batchsize),:])
-		meanvalidacc += layer2.ClassificationAccuracy(testSet[1][(batch*batchsize):((batch+1)*batchsize),:])
+		preds = firstlayer.FeedForwardPredict(testSet[0][(batch*batchsize):((batch+1)*batchsize),:])
+		meanvalidacc += ClassificationAccuracy(preds, testSet[1][(batch*batchsize):((batch+1)*batchsize),:])
 	meanvalidacc /= allDTYPE(batchesPerValidEpoch)
 	print("@@@@@@@@@@ validation accuracy at epoch "+str(epoch+1)+"/"+str(maxNumEpochs)+" == "+str(meanvalidacc))
 	epochindicessaved.append(allDTYPE(epoch+1))

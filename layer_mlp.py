@@ -1,9 +1,14 @@
-'''Copyright (c) 2015 Jason Bunk
+'''Copyright (c) 2016 Jason Bunk
 Covered by LICENSE.txt, which contains the "MIT License (Expat)".
 '''
 import numpy as np
-import sigmoids
+import activations
+import costfuncs
 import cPickle, os, os.path
+#from fastdot import dot as blasdot
+def mydotpr(a,b):
+	#return blasdot(a,b)
+	return np.dot(a,b)
 
 ''' MLP layer
 =============
@@ -68,10 +73,31 @@ Output of each MLPlayer will also be a matrix, whose rows are the independent sa
 Little delta ldN will be a matrix with a number of rows equal to the number of input samples; so
 dJ/dbN = mean{ldN}
 dJ/dWN = mean{matrix multiplication of each row of ldN with corresponding column of (input(Nth MLPlayer)^T)}
+
+Weight decay
+=============================
+A weight decay term can be added to cost J, this takes the form
+lambda*0.5*|Wk|^2 where |Wk| is the Frobenius norm of weight matrix W of layer k.
+
+The total cost function (e.g. for a 3-layer network outputting prediction s3) can then be written as
+J(s3) = 0.5*|s3-y|^2 + lambda*0.5*(|W1|^2+|W2|^2+|W3|^2)
+
+Then the gradient dJ/dWk for layer k simply has the additional term lambda*Wk.
+Lambda should be set to a small value, perhaps 0.001.
+
 '''
 
+#-------------------------------------------------------------------------------
+# Can be used to test prediction accuracy without actually instantiating a layer_mlp.
+#
+def ClassificationAccuracy(ypred, ytrue):
+	return np.mean(ytrue[np.arange(ytrue.shape[0]), np.argmax(ypred,axis=1)])
+
+#-------------------------------------------------------------------------------
+# Fully-connected layer of a neural network, described in comments above.
+#
 class mlplayer(object):
-	def __init__(self, nin, nout, sigmoidalfunc=sigmoids.sigmoid, layerName="", saveAndUseSavedWeights=False, checkgradients=False):
+	def __init__(self, nin, nout, activation=activations.sigmoid, costfunc=costfuncs.MSE, L2lambda=0.0, dropoutProb=0.0, useMomentum=False, layerName="", initializationStd=-1, saveAndUseSavedWeights=False, checkgradients=False):
 		self.layertype = 'mlp'
 		self.layerNext = None #if None, this is the end
 		self.layerPrev = None #if None, this is the beginning
@@ -86,9 +112,19 @@ class mlplayer(object):
 		
 		self.nin = nin
 		self.nout = nout
-		wrange = np.sqrt(37.5/float(nin+nout)) #heuristic for the randomly generated weights
-		self.W = np.asarray(np.random.uniform(-1.*wrange, wrange, (nin,nout)), dtype=DTYPE)
+		if initializationStd < 0:
+			wrange = 6.0*np.sqrt(1.0/float(nin+nout)) #heuristic for the randomly generated weights
+			self.W = np.asarray(np.random.uniform(-1.*wrange, wrange, (nin,nout)), dtype=DTYPE)
+		else:
+			wrange = initializationStd
+			self.W = np.asarray(np.random.normal(scale=wrange,size=(nin,nout)), dtype=DTYPE)
 		self.b = np.zeros((1,nout),dtype=DTYPE) #row vector
+		self.L2lambda = L2lambda
+		self.dropoutProb = dropoutProb
+		self.useMomentum = useMomentum
+		if self.useMomentum:
+			self.accumdW = np.zeros(self.W.shape,dtype=self.W.dtype)
+			self.accumdb = np.zeros(self.b.shape,dtype=self.b.dtype)
 		
 		if saveAndUseSavedWeights:
 			weightsfname = layerName+"_weights.pkl"
@@ -108,7 +144,8 @@ class mlplayer(object):
 			self.Wshape = self.W.shape
 			self.bshape = self.b.shape
 		
-		self.sigmoidalfunc = sigmoidalfunc
+		self.costfunc = costfunc
+		self.activation = activation
 		self.lastinput = None
 		self.lastz = None
 		self.lasta = None
@@ -116,33 +153,44 @@ class mlplayer(object):
 	#-------------------------------------------------------------------------------
 	# Call once, from the first input layer, and returns the network's final output.
 	#
-	def FeedForwardPredict(self, xx):
-		self.lastinput = xx
-		self.lastz = np.dot(xx, self.W) + self.b
-		self.lasta = self.sigmoidalfunc.calc(self.lastz)
+	def FeedForwardPredict(self, xx, testTime=False):
+		if self.dropoutProb > 0.0 and not testTime:
+			dropoutmask = np.random.binomial(n=1,p=(1.0-self.dropoutProb),size=xx.shape)
+			self.lastinput = np.multiply(xx,dropoutmask)
+		else:
+			self.lastinput = xx
+		if testTime:
+			useweights = (1-self.dropoutProb)*self.W
+		else:
+			useweights = self.W
+		
+		self.lastz = mydotpr(self.lastinput, useweights) + self.b
+		
 		if self.layerNext is None:
+			self.lasta = self.lastz # activation not needed on topmost layer
 			return self.lasta
 		else:
-			return self.layerNext.FeedForwardPredict(self.lasta)
+			self.lasta = self.activation.calc(self.lastz)
+			return self.layerNext.FeedForwardPredict(self.lasta, testTime=testTime)
 	
 	#-------------------------------------------------------------------------------
 	# Call once, from the final output layer, AFTER calling "FeedForwardPredict".
 	#
-	def BackPropUpdate_MSE(self, yy, learnRate, incomingdelta=None):
+	def BackPropUpdate(self, yy, learnRate, momentum=0.0, incomingdelta=None):
 		# calculate little delta
-		if incomingdelta is None:
-			assert(self.layerNext is None)
+		if incomingdelta is None or self.layerNext is None:
+			assert(self.layerNext is None and incomingdelta is None)
 			assert(yy is not None and self.lasta.shape == yy.shape)
 			if yy.dtype != self.W.dtype:
 				yy = np.asarray(yy,dtype=self.W.dtype)
-			aydiff = np.subtract(self.lasta, yy)
-			littledelta = np.multiply(aydiff, self.sigmoidalfunc.calcderiv(self.lastz))
+			#littledelta = np.multiply(self.costfunc.backward(self.lasta, yy), self.activation.calcderiv(self.lastz))
+			littledelta = self.costfunc.backward(self.lasta, yy) # activation not needed on topmost layer
 		else:
 			assert(self.layerNext is not None)
-			littledelta = np.multiply(incomingdelta, self.sigmoidalfunc.calcderiv(self.lastz))
+			littledelta = np.multiply(incomingdelta, self.activation.calcderiv(self.lastz))
 		
 		# little delta has a number of rows equal to the number of input samples (and a number of columns equal to the number of outputs)
-		db = np.mean(littledelta,axis=0)
+		db = np.sum(littledelta,axis=0)
 		db = np.reshape(db,(1,self.nout))
 		
 		# dot each row (sample) of littledelta with corresponding row (sample) of the lastinput
@@ -150,30 +198,57 @@ class mlplayer(object):
 		for nn in range(littledelta.shape[0]):
 			term1 = np.reshape(littledelta[nn,:], (1,self.nout))
 			term2 = np.reshape(self.lastinput[nn,:], (1,self.nin))
-			dW += np.dot(np.transpose(term2), term1)
-		dW *= (1. / float(littledelta.shape[0]))
+			dW += mydotpr(np.transpose(term2), term1)
+		dW += self.L2lambda*self.W
 		
 		if self.checkgradients:
-			self.CheckGradient(yy, littledelta, db, dW, self.MSE_Error)
+			if self.layerPrev is not None:
+				self.CheckGradient(yy, littledelta, db, dW, self.layerPrev.ComputeCost)
+			else:
+				self.CheckGradient(yy, littledelta, db, dW, self.ComputeCost)
 		else:
 			# gradient descent; can't update while checking gradients, if checking gradients
-			self.b -= db * abs(learnRate)
-			self.W -= dW * abs(learnRate)
+			if self.useMomentum:
+				if momentum <= 0.0 or momentum >= 1.0:
+					print("warning: momentum outside range (0,1): momentum == "+str(momentum))
+				self.accumdb = (self.accumdb * momentum) + db
+				self.accumdW = (self.accumdW * momentum) + dW
+				self.b -= self.accumdb * abs(learnRate)
+				self.W -= self.accumdW * abs(learnRate)
+			else:
+				self.b -= db * abs(learnRate)
+				self.W -= dW * abs(learnRate)
 		
 		# propogate backwards; previous layer will not need truth yy except for checking gradients
 		if self.layerPrev is not None:
-			nextdelta = np.dot(littledelta, np.transpose(self.W))
+			nextdelta = mydotpr(littledelta, np.transpose(self.W))
 			if self.layerPrev.layertype == 'conv':
 				# reshape nextdelta to the conv layer's output shape
 				nextdelta = np.reshape(nextdelta, self.layerPrev.outputshape)
 			if self.checkgradients:
-				self.layerPrev.BackPropUpdate_MSE(yy, learnRate, nextdelta)
+				self.layerPrev.BackPropUpdate(yy, learnRate, momentum=momentum, incomingdelta=nextdelta)
 			else:
-				self.layerPrev.BackPropUpdate_MSE(None, learnRate, nextdelta)
-		
-		if self.layerNext is None: #if top layer, return loss (MSE)
-			aydiff = np.abs(aydiff)
-			return 0.5 * np.sum(np.multiply(aydiff, aydiff)) / float(aydiff.shape[0])
+				self.layerPrev.BackPropUpdate(None, learnRate, momentum=momentum, incomingdelta=nextdelta)
+	
+	#-------------------------------------------------------------------------------
+	# Call from the input layer AFTER calling "FeedForwardPredict".
+	#
+	def ComputeCost(self, yy):
+		if self.layerNext is None:
+			return self.costfunc.forward(self.lasta, yy) + 0.5*self.L2lambda*np.sum(np.multiply(self.W,self.W))
+		else:
+			return self.layerNext.ComputeCost(yy) + 0.5*self.L2lambda*np.sum(np.multiply(self.W,self.W))
+	
+	#-------------------------------------------------------------------------------
+	# Call from the final output layer AFTER calling "FeedForwardPredict".
+	#
+	def ClassificationAccuracy(self, yy):
+		# yy and lasta have shape (nsamples, nclasses)
+		# predictions for each sample are argmax amongst classes
+		if self.layerNext is None:
+			return np.mean(yy[np.arange(yy.shape[0]), np.argmax(self.lasta,axis=1)])
+		else:
+			return self.layerNext.ClassificationAccuracy(yy)
 	
 	#-------------------------------------------------------------------------------
 	# Used for testing.
@@ -188,73 +263,62 @@ class mlplayer(object):
 		Wsaved = np.copy(self.W)
 		bsaved = np.copy(self.b)
 		lastinputsaved = np.copy(self.lastinput)
-		self.FeedForwardPredict(lastinputsaved)
-		origcost = errorfunc(yy)
+		maxeps = 1e-7
+		tinyscale  = 0.0001
+		maxreldiff = 0.01
 		
 		for ii in range(self.nout):
 			self.b = np.copy(bsaved)
-			tinyamt = np.abs(self.b[0,ii]) * 0.0001
-			if tinyamt < 0.00000000001:
-				tinyamt = 0.000001
+			tinyamt = np.abs(self.b[0,ii]) * tinyscale
+			tinyamt = max(tinyamt,maxeps)
 			self.b[0,ii] += tinyamt
 			self.FeedForwardPredict(lastinputsaved)
-			newcost = errorfunc(yy)
-			newdb = (newcost-origcost)/tinyamt
+			costR = errorfunc(yy)
+			self.b = np.copy(bsaved)
+			self.b[0,ii] -= tinyamt
+			self.FeedForwardPredict(lastinputsaved)
+			costL = errorfunc(yy)
+			newdb = (costR-costL)/(tinyamt*2.)
 			denom = 0.5*(np.abs(newdb)+np.abs(db[0,ii]))
 			if denom > 0.:
 				absdiff = np.abs(newdb-db[0,ii])
 				reldiff = absdiff/denom
-				if (reldiff > 0.01 and denom > 0.0001) or (absdiff > 0.001 and denom < 3.):
+				relgrad = denom/max(np.abs(self.b[0,ii]),tinyamt)
+				if reldiff > maxreldiff and relgrad > maxreldiff:
 					print("    "+self.layerName+" self.b[0,"+str(ii)+"] == "+str(self.b[0,ii]))
 					print("    db[0,"+str(ii)+"] == "+str(db[0,ii])+", calculated dJ/db[0,"+str(ii)+"] == "+str(newdb))
 					print("    b[0,"+str(ii)+"]: relative difference == "+str(reldiff)+", denom == "+str(denom))
-					print("    origcost == "+str(origcost)+", newcost == "+str(newcost))
+					print("    costL == "+str(costL)+", costR == "+str(costR))
+					print("    relgrad == "+str(relgrad))
 					quit()
 		self.b = np.copy(bsaved)
 		
 		for ii in range(self.W.shape[0]):
 			for jj in range(self.W.shape[1]):
 				self.W = np.copy(Wsaved)
-				tinyamt = np.abs(self.W[ii,jj]) * 0.0001
-				if tinyamt < 0.00000000001:
-					tinyamt = 0.000001
+				tinyamt = np.abs(self.W[ii,jj]) * tinyscale
+				tinyamt = max(tinyamt,maxeps)
 				self.W[ii,jj] += tinyamt
 				self.FeedForwardPredict(lastinputsaved)
-				newcost = errorfunc(yy)
-				newdw = (newcost-origcost)/tinyamt
+				costR = errorfunc(yy)
+				self.W = np.copy(Wsaved)
+				self.W[ii,jj] -= tinyamt
+				self.FeedForwardPredict(lastinputsaved)
+				costL = errorfunc(yy)
+				newdw = (costR-costL)/(tinyamt*2.)
 				denom = 0.5*(np.abs(newdw)+np.abs(dW[ii,jj]))
 				if denom > 0.:
 					absdiff = np.abs(newdw-dW[ii,jj])
 					reldiff = absdiff/denom
-					if (reldiff > 0.01 and denom > 0.0001) or (absdiff > 0.001 and denom < 3.):
+					relgrad = denom/max(np.abs(self.W[ii,jj]),tinyamt)
+					if reldiff > maxreldiff and relgrad > maxreldiff:
 						print("    "+self.layerName+" self.W["+str(ii)+","+str(jj)+"] == "+str(self.W[ii,jj])+", tinyamt == "+str(tinyamt))
 						print("    dW["+str(ii)+","+str(jj)+"] == "+str(dW[ii,jj])+", calculated dJ/dW["+str(ii)+","+str(jj)+"] == "+str(newdw))
 						print("    dW["+str(ii)+","+str(jj)+"]: relative difference == "+str(reldiff)+", denom == "+str(denom))
-						print("    origcost == "+str(origcost)+", newcost == "+str(newcost))
+						print("    costL == "+str(costL)+", costR == "+str(costR))
+						print("    relgrad == "+str(relgrad))
 						quit()
 		self.W = np.copy(Wsaved)
-	
-	#-------------------------------------------------------------------------------
-	# Call from the final output layer AFTER calling "FeedForwardPredict".
-	#
-	def ClassificationAccuracy(self, yy):
-		# yy and lasta have shape (nsamples, nclasses)
-		# predictions for each sample are argmax amongst classes
-		if self.layerNext is None:
-			return np.mean(yy[np.arange(yy.shape[0]), np.argmax(self.lasta,axis=1)])
-		else:
-			return self.layerNext.ClassificationAccuracy(yy)
-	
-	#-------------------------------------------------------------------------------
-	# Call from the final output layer AFTER calling "FeedForwardPredict".
-	#
-	def MSE_Error(self, yy):
-		if self.layerNext is None:
-			aydiff = np.abs(np.subtract(self.lasta, yy))
-			return 0.5 * np.sum(np.multiply(aydiff, aydiff)) / float(aydiff.shape[0])
-		else:
-			return self.layerNext.MSE_Error(yy)
-
 
 
 

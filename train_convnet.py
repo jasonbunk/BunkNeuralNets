@@ -4,10 +4,13 @@ Covered by LICENSE.txt, which contains the "MIT License (Expat)".
 import numpy as np
 import layer_mlp
 import layer_conv
-import sigmoids
+import activations
+import costfuncs
+from costfuncs import ClassificationAccuracy
 import theanos_MNIST_loader
 import readcifar10
 import sys, imp
+import utils
 try:
 	imp.find_module('matplotlib')
 	matplotlibAvailable = True
@@ -30,7 +33,7 @@ if isCIFAR:
 else:
 	print("Will train on MNIST dataset.")
 
-CheckNetworkGradients = True # this prevents training
+CheckNetworkGradients = False # this prevents training
 ViewFilters = True
 ViewSamples = True
 if len(sys.argv) > 2:
@@ -44,7 +47,6 @@ if len(sys.argv) > 2:
 
 if ViewFilters or ViewSamples:
 	print("note: viewing samples/filters requires python-opencv")
-	import utils
 	import cv2
 if isCIFAR:
 	oneimshape = (3,32,32)
@@ -96,10 +98,9 @@ batchsize = 20
 maxNumEpochs = 200
 batchesPerTrainEpoch = int(trainSet[0].shape[0]) / int(batchsize)
 batchesPerValidEpoch = int(testSet[0].shape[0]) / int(batchsize)
-# use exponentially decaying learning rate: lr = lrinitial*exp(-epoch/lrtimescale)
-lrinitial = 0.09
-lrtimescale = 500.
-mysigmoid = sigmoids.sigmoid()
+LEARNRATE = 0.01
+myactivation = activations.sigmoid
+mycostfunc = costfuncs.SoftmaxCrossEntropy
 
 #---------------------------------------------
 nextimshape = (batchsize, oneimshape[0], oneimshape[1], oneimshape[2])
@@ -110,7 +111,7 @@ netlayers = []
 for idx in range(len(filtsizes)):
 	filtshape = (nfilters[idx], nextimshape[1], filtsizes[idx], filtsizes[idx])
 	mypoolshape = (poolsizes[idx], poolsizes[idx])
-	netlayers.append(layer_conv.convlayer(nextimshape, filtshape, poolshape=mypoolshape, sigmoidalfunc=mysigmoid, layerName="convlayer"+str(len(netlayers)), checkgradients=CheckNetworkGradients))
+	netlayers.append(layer_conv.convlayer(nextimshape, filtshape, poolshape=mypoolshape, activation=myactivation, layerName="convlayer"+str(len(netlayers)), checkgradients=CheckNetworkGradients))
 	if len(netlayers) > 1:
 		netlayers[-1].layerPrev = netlayers[-2]
 	nextimshape = (batchsize, nfilters[idx], netlayers[-1].outputshape[2], netlayers[-1].outputshape[3])
@@ -119,7 +120,7 @@ for idx in range(len(filtsizes)):
 #build fully-connected layers
 nextnumin = np.prod(nextimshape[1:])
 for idx in range(len(nhiddens)):
-	netlayers.append(layer_mlp.mlplayer(nextnumin, nhiddens[idx], sigmoidalfunc=mysigmoid, layerName="fclayer"+str(len(netlayers)), checkgradients=CheckNetworkGradients))
+	netlayers.append(layer_mlp.mlplayer(nextnumin, nhiddens[idx], activation=myactivation, costfunc=mycostfunc, layerName="fclayer"+str(len(netlayers)), checkgradients=CheckNetworkGradients))
 	if len(netlayers) > 1:
 		netlayers[-1].layerPrev = netlayers[-2]
 	nextnumin = nhiddens[idx]
@@ -139,21 +140,30 @@ if matplotlibAvailable and (ViewFilters or ViewSamples):
 	ax2 = ax1.twinx()
 
 for epoch in range(maxNumEpochs):
-	LEARNRATE = lrinitial * np.exp(-1.*allDTYPE(epoch)/lrtimescale)
-	
 	totaloflosses = 0.
+	meantrainacc = 0.
+	numtrainevals = 0
 	for batch in range(batchesPerTrainEpoch):
-		netlayers[0].FeedForwardPredict(trainSet[0][(batch*batchsize):((batch+1)*batchsize),:])
-		loss = netlayers[-1].BackPropUpdate_MSE(trainSet[1][(batch*batchsize):((batch+1)*batchsize),:], LEARNRATE)
+		batch_xs = trainSet[0][(batch*batchsize):((batch+1)*batchsize),:]
+		batch_ys = trainSet[1][(batch*batchsize):((batch+1)*batchsize),:]
+		
+		preds = netlayers[0].FeedForwardPredict(batch_xs)
+		loss = netlayers[0].ComputeCost(batch_ys)
+		meantrainacc += ClassificationAccuracy(preds, batch_ys)
+		netlayers[-1].BackPropUpdate(batch_ys, LEARNRATE)
+		
+		numtrainevals += 1
 		totaloflosses += loss
-		if batch % 50 == 0:
-			print("loss at epoch "+str(epoch+1)+"/"+str(maxNumEpochs)+", batch "+str(batch+1)+"/"+str(batchesPerTrainEpoch)+" == "+str(loss))
+		if (batch+1) % 50 == 0:
+			print("epoch "+str(epoch+1)+"/"+str(maxNumEpochs)+", batch "+str(batch+1)+"/"+str(batchesPerTrainEpoch)+", loss: "+str(loss)+", training accuracy: "+str((meantrainacc/float(numtrainevals))*100.))
+			meantrainacc = 0.
+			numtrainevals = 0
 	losses.append(totaloflosses / allDTYPE(batchesPerTrainEpoch))
 	
 	meanvalidacc = 0.
 	for batch in range(batchesPerValidEpoch):
-		netlayers[0].FeedForwardPredict(testSet[0][(batch*batchsize):((batch+1)*batchsize),:])
-		meanvalidacc += netlayers[-1].ClassificationAccuracy(testSet[1][(batch*batchsize):((batch+1)*batchsize),:])
+		preds = netlayers[0].FeedForwardPredict(testSet[0][(batch*batchsize):((batch+1)*batchsize),:])
+		meanvalidacc += ClassificationAccuracy(preds, testSet[1][(batch*batchsize):((batch+1)*batchsize),:])
 	meanvalidacc /= allDTYPE(batchesPerValidEpoch)
 	print("@@@@@@@@@@ validation accuracy at epoch "+str(epoch+1)+"/"+str(maxNumEpochs)+" == "+str(meanvalidacc))
 	epochindicessaved.append(allDTYPE(epoch+1))

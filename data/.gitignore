@@ -1,2 +1,3 @@
 #ignore data in this folder
-*.gz
+*
+!.gitignore

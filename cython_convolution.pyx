@@ -6,10 +6,10 @@ import numpy as np
 cimport numpy as np
 
 #fix a datatype for the arrays
-#DTYPE = np.float32
-#ctypedef np.float32_t DTYPE_t
-DTYPE = np.float64
-ctypedef np.float64_t DTYPE_t
+DTYPE = np.float32
+ctypedef np.float32_t DTYPE_t
+#DTYPE = np.float64
+#ctypedef np.float64_t DTYPE_t
 
 cdef inline unsigned int uint_max(unsigned int a, unsigned int b): return a if a >= b else b
 cdef inline unsigned int uint_min(unsigned int a, unsigned int b): return a if a <= b else b
